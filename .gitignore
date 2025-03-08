@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Blockchain-spezifisch
+*.log
+blockchain_checkpoint.pkl
+blockchain_checkpoint_meta.json
+
+# Wallets
+*.json
