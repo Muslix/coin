@@ -1,0 +1,181 @@
+name: Blockchain CI/CD
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Install required packages for blockchain project
+          pip install flask flask-cors requests cryptography
+          # Install linting tools
+          pip install flake8 pylint
+          # Save dependencies to requirements.txt if not exists
+          if [ ! -f requirements.txt ]; then
+            pip freeze > requirements.txt
+          fi
+
+      - name: Lint with flake8
+        run: |
+          # Stop the build if there are Python syntax errors or undefined names
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+          # Exit-zero treats all errors as warnings
+          flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+
+      - name: Validate Python Files
+        run: |
+          # Check if Python files can be compiled
+          python -m compileall .
+          echo "Python validation completed successfully"
+
+      - name: Static Security Analysis
+        run: |
+          # Install security scanning tool
+          pip install bandit
+          # Run security scan (exclude tests)
+          bandit -r . -ll --exclude ./tests
+
+      - name: Blockchain Validation
+        run: |
+          # Create a simple test to validate blockchain functionality
+          cat > validate_blockchain.py << 'EOF'
+          from blockchain import Blockchain, Block
+          
+          def test_blockchain_initialization():
+              """Test if blockchain can be initialized correctly"""
+              blockchain = Blockchain()
+              assert len(blockchain.chain) == 1  # Genesis block
+              assert blockchain.chain[0].index == 0
+              print("✅ Blockchain initializes correctly with genesis block")
+          
+          def test_block_creation():
+              """Test if a block can be created properly"""
+              block = Block(1, 123456789, [], "test_hash")
+              assert block.index == 1
+              assert block.timestamp == 123456789
+              assert block.calculate_hash() == block.hash
+              print("✅ Block creation test passed")
+          
+          if __name__ == "__main__":
+              print("Running basic blockchain validation...")
+              test_blockchain_initialization()
+              test_block_creation()
+              print("All validation tests passed!")
+          EOF
+          
+          # Run validation script
+          python validate_blockchain.py
+
+  build:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install flask flask-cors requests cryptography
+          # Install packaging tools
+          pip install setuptools wheel
+
+      - name: Create Requirements File
+        run: |
+          # Create requirements.txt if it doesn't exist
+          if [ ! -f requirements.txt ]; then
+            cat > requirements.txt << EOF
+          flask>=2.0.0
+          flask-cors>=3.0.10
+          requests>=2.25.1
+          cryptography>=36.0.0
+          EOF
+          fi
+
+      - name: Package Application
+        run: |
+          # Create setup.py file for packaging
+          cat > setup.py << EOF
+          from setuptools import setup, find_packages
+          
+          setup(
+              name="cryptocoin-blockchain",
+              version="0.1.0",
+              packages=find_packages(),
+              install_requires=[
+                  "flask>=2.0.0",
+                  "flask-cors>=3.0.10",
+                  "requests>=2.25.1",
+                  "cryptography>=36.0.0",
+              ],
+              python_requires=">=3.7",
+              entry_points={
+                  "console_scripts": [
+                      "cryptocoin=main:main",
+                  ],
+              },
+          )
+          EOF
+          
+          # Build the package
+          python setup.py sdist bdist_wheel
+          echo "Package built successfully"
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: blockchain-package
+          path: |
+            dist/
+            requirements.txt
+
+      - name: Create Release
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Create release version from date and commit hash
+          VERSION=$(date +'%Y.%m.%d')-$(git rev-parse --short HEAD)
+          echo "Creating release v$VERSION"
+          
+          # Create release notes
+          cat > release_notes.md << EOF
+          # Blockchain Release $VERSION
+          
+          Automatic release from CI/CD pipeline
+          
+          ## Included Changes
+          $(git log -3 --pretty=format:"* %s" --no-merges)
+          
+          ## Installation
+          \`\`\`
+          pip install cryptocoin-blockchain
+          \`\`\`
+          EOF
+          
+          # Create GitHub Release (this is commented out since it requires proper token configuration)
+          # Use this once you've set up proper permissions
+          # gh release create v$VERSION --notes-file release_notes.md --title "Release v$VERSION" dist/*.whl
+          
+          echo "Release creation steps completed - enable actual release when ready"
