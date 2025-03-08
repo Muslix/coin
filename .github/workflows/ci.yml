@@ -16,7 +16,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.9'
+          python-version: '3.10'
           cache: 'pip'
 
       - name: Install Dependencies
@@ -51,12 +51,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.9'
+          python-version: '3.10'
 
       - name: Install Dependencies
         run: |
@@ -89,12 +89,12 @@ jobs:
               version="0.1.0",
               packages=find_packages(),
               install_requires=[
-                  "flask>=2.0.0",
-                  "flask-cors>=3.0.10",
-                  "requests>=2.25.1",
-                  "cryptography>=36.0.0",
+                  "flask",
+                  "flask-cors",
+                  "requests",
+                  "cryptography",
               ],
-              python_requires=">=3.7",
+              python_requires=">=3.8",
               entry_points={
                   "console_scripts": [
                       "cryptocoin=main:main",
@@ -107,8 +107,9 @@ jobs:
           python setup.py sdist bdist_wheel
           echo "Package built successfully"
 
+      # Aktualisiert auf die neueste v4 Version
       - name: Upload Build Artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: blockchain-package
           path: |
