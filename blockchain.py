@@ -5,6 +5,7 @@ import threading
 import logging
 import pickle
 import os
+import requests
 from typing import List, Dict, Any, Callable, Optional, Set, Union, Tuple
 
 # Konfiguration des Loggings
@@ -15,9 +16,6 @@ logging.basicConfig(
     filemode='a'
 )
 logger = logging.getLogger('blockchain')
-
-# Zusätzlicher Logger für Checkpoints und Pausierung
-checkpoint_logger = logging.getLogger('blockchain.checkpoint')
 
 
 class MerkleTree:
@@ -108,7 +106,16 @@ class Block:
 
 
 class Blockchain:
-    def __init__(self, difficulty: int = 4):
+    # Fest definierter Genesis-Block für Konsistenz zwischen Nodes
+    GENESIS_TIMESTAMP = 1684792800.0  # Ein fester Zeitpunkt (z.B. 23. Mai 2023 00:00:00 UTC)
+    GENESIS_MESSAGE = "Genesis Block - First block in the chain"
+    GENESIS_PREV_HASH = "0"
+    GENESIS_NONCE = 0
+    
+    # Erhöhe die Standardschwierigkeit auf 6, damit Blöcke nicht so schnell gefunden werden
+    DEFAULT_DIFFICULTY = 6
+
+    def __init__(self, difficulty: int = DEFAULT_DIFFICULTY):
         self.chain: List[Block] = []
         self.difficulty = difficulty
         self.pending_transactions: List[Dict[str, Any]] = []
@@ -116,6 +123,7 @@ class Blockchain:
         self._mining_thread: Optional[threading.Thread] = None
         self._stop_mining = threading.Event()
         self.mining_callback: Optional[Callable] = None
+        self._sync_callback: Optional[Callable] = None
         
         # Double-Spend-Prävention
         self._processed_tx_ids: Set[str] = set()
@@ -128,17 +136,18 @@ class Blockchain:
         # Smart Contract Engine hinzufügen (wird später initialisiert)
         self.contract_engine = None
         
-        # Dateien für Checkpoints und Pausierung
+        # Checkpoint-bezogene Attribute
         self.checkpoint_file = "blockchain_checkpoint.pkl"
         self.checkpoint_metadata_file = "blockchain_checkpoint_meta.json"
         self.is_paused = False
         self.pause_timestamp = None
+        self.checkpoint_logger = logging.getLogger('blockchain.checkpoint')
         
         # Create the genesis block
         self.create_genesis_block()
         
-        logger.info("Blockchain initialized with difficulty " + str(difficulty))
-        
+        logger.info(f"Blockchain initialized with difficulty {difficulty}")
+
     def create_checkpoint(self, reason: str = "Manual checkpoint") -> bool:
         """
         Erstellt einen Checkpoint des aktuellen Blockchain-Zustands
@@ -150,7 +159,7 @@ class Blockchain:
             True bei Erfolg, False bei Fehler
         """
         try:
-            checkpoint_logger.info(f"Erstelle Checkpoint: {reason}")
+            self.checkpoint_logger.info(f"Erstelle Checkpoint: {reason}")
             
             # Metadaten zum Checkpoint
             metadata = {
@@ -180,15 +189,15 @@ class Blockchain:
                     'last_difficulty_adjustment_time': self.last_difficulty_adjustment_time
                 }, checkpoint_file)
                 
-            checkpoint_logger.info(f"Checkpoint erfolgreich erstellt: {len(self.chain)} Blöcke")
+            self.checkpoint_logger.info(f"Checkpoint erfolgreich erstellt: {len(self.chain)} Blöcke")
             print(f"Checkpoint erfolgreich erstellt: {len(self.chain)} Blöcke")
             return True
             
         except Exception as e:
-            checkpoint_logger.error(f"Fehler beim Erstellen des Checkpoints: {str(e)}")
+            self.checkpoint_logger.error(f"Fehler beim Erstellen des Checkpoints: {str(e)}")
             print(f"Fehler beim Erstellen des Checkpoints: {str(e)}")
             return False
-            
+
     def _calculate_blockchain_hash(self) -> str:
         """
         Berechnet einen Hash über die gesamte Blockchain für Integritätsprüfungen
@@ -207,7 +216,7 @@ class Blockchain:
             (Erfolg, Metadaten) - Tupel mit bool und Checkpoint-Metadaten oder None bei Fehler
         """
         if not os.path.exists(self.checkpoint_file) or not os.path.exists(self.checkpoint_metadata_file):
-            checkpoint_logger.warning("Keine Checkpoint-Dateien gefunden")
+            self.checkpoint_logger.warning("Keine Checkpoint-Dateien gefunden")
             return False, None
             
         try:
@@ -228,24 +237,24 @@ class Blockchain:
             self.target_block_time = state['target_block_time']
             self.last_difficulty_adjustment_time = state['last_difficulty_adjustment_time']
             
-            checkpoint_logger.info(f"Checkpoint geladen: {len(self.chain)} Blöcke, " 
-                                   f"erstellt am {time.ctime(metadata['timestamp'])}")
+            self.checkpoint_logger.info(f"Checkpoint geladen: {len(self.chain)} Blöcke, " 
+                                        f"erstellt am {time.ctime(metadata['timestamp'])}")
             print(f"Checkpoint geladen: {len(self.chain)} Blöcke")
             
             # Optional: Validierung durchführen
             if validate:
                 is_valid, issues = self.comprehensive_validation()
                 if not is_valid:
-                    checkpoint_logger.error(f"Validierungsfehler nach Checkpoint-Wiederherstellung: {issues}")
+                    self.checkpoint_logger.error(f"Validierungsfehler nach Checkpoint-Wiederherstellung: {issues}")
                     print(f"WARNUNG: Validierungsfehler nach Wiederherstellung: {issues}")
                 else:
-                    checkpoint_logger.info("Checkpoint-Validierung erfolgreich")
+                    self.checkpoint_logger.info("Checkpoint-Validierung erfolgreich")
                     print("Checkpoint-Validierung erfolgreich")
             
             return True, metadata
             
         except Exception as e:
-            checkpoint_logger.error(f"Fehler beim Laden des Checkpoints: {str(e)}")
+            self.checkpoint_logger.error(f"Fehler beim Laden des Checkpoints: {str(e)}")
             print(f"Fehler beim Laden des Checkpoints: {str(e)}")
             return False, None
     
@@ -276,12 +285,12 @@ class Blockchain:
             self.is_paused = True
             self.pause_timestamp = time.time()
             
-            checkpoint_logger.info(f"Blockchain pausiert: {reason}")
+            self.checkpoint_logger.info(f"Blockchain pausiert: {reason}")
             print(f"Blockchain erfolgreich pausiert: {reason}")
             return True
             
         except Exception as e:
-            checkpoint_logger.error(f"Fehler beim Pausieren der Blockchain: {str(e)}")
+            self.checkpoint_logger.error(f"Fehler beim Pausieren der Blockchain: {str(e)}")
             print(f"Fehler beim Pausieren der Blockchain: {str(e)}")
             return False
     
@@ -316,15 +325,15 @@ class Blockchain:
             self.pause_timestamp = None
             
             pause_duration = time.time() - metadata['timestamp']
-            checkpoint_logger.info(f"Blockchain fortgesetzt nach {pause_duration:.1f} Sekunden")
+            self.checkpoint_logger.info(f"Blockchain fortgesetzt nach {pause_duration:.1f} Sekunden")
             print(f"Blockchain erfolgreich fortgesetzt (Pausiert für {pause_duration:.1f} Sekunden)")
             return True
             
         except Exception as e:
-            checkpoint_logger.error(f"Fehler beim Fortsetzen der Blockchain: {str(e)}")
+            self.checkpoint_logger.error(f"Fehler beim Fortsetzen der Blockchain: {str(e)}")
             print(f"Fehler beim Fortsetzen der Blockchain: {str(e)}")
             return False
-            
+
     def comprehensive_validation(self) -> Tuple[bool, List[str]]:
         """
         Führt eine umfassende Validierung der Blockchain durch
@@ -392,20 +401,37 @@ class Blockchain:
      
     def create_genesis_block(self) -> None:
         """
-        Create the first block in the chain
+        Create the first block in the chain with deterministic values
         """
+        # Prüfe, ob bereits ein Chain-Checkpoint existiert
+        if os.path.exists(self.checkpoint_file) and os.path.exists(self.checkpoint_metadata_file):
+            success, _ = self.load_checkpoint(validate=False)
+            if success:
+                logger.info("Genesis block loaded from checkpoint")
+                return
+                
+        # Erstelle einen deterministischen Genesis-Block (immer gleicher Inhalt)
         genesis_transactions = [{
             "from": "genesis",
             "to": "network",
             "amount": 0,
-            "timestamp": time.time(),
-            "message": "Genesis Block - First block in the chain"
+            "timestamp": self.GENESIS_TIMESTAMP,
+            "message": self.GENESIS_MESSAGE
         }]
         
-        genesis_block = Block(0, time.time(), genesis_transactions, "0")
-        genesis_block.mine_block(self.difficulty)
+        # Verwende feste Parameter für den Genesis-Block
+        genesis_block = Block(0, self.GENESIS_TIMESTAMP, genesis_transactions, self.GENESIS_PREV_HASH, self.GENESIS_NONCE)
+        
+        # Berechne den Hash manuell (ohne Mining)
+        genesis_block.hash = genesis_block.calculate_hash()
+        genesis_block.difficulty = self.difficulty
+        
+        # In die Kette einfügen
         self.chain.append(genesis_block)
-        logger.info("Genesis block created")
+        logger.info(f"Genesis block created: {genesis_block.hash}")
+        
+        # Optional: Checkpoint erstellen, damit neue Nodes dieselbe Chain haben
+        self.create_checkpoint("Initial genesis block")
         
     def get_latest_block(self) -> Block:
         """
@@ -497,13 +523,14 @@ class Blockchain:
         
         self.last_difficulty_adjustment_time = current_time
         
-    def start_continuous_mining(self, miner_address: str, callback: Optional[Callable] = None) -> None:
+    def start_continuous_mining(self, miner_address: str, callback: Optional[Callable] = None, sync_callback: Optional[Callable] = None) -> None:
         """
         Start continuous mining in a background thread
         
         Args:
             miner_address: Address to receive mining rewards
             callback: Optional callback function called when a new block is mined
+            sync_callback: Optional callback to synchronize with network before mining
         """
         if self._mining_thread and self._mining_thread.is_alive():
             logger.warning("Mining already in progress")
@@ -512,6 +539,7 @@ class Blockchain:
             
         self._stop_mining.clear()
         self.mining_callback = callback
+        self._sync_callback = sync_callback
         
         def mining_thread():
             logger.info(f"Starting continuous mining with difficulty {self.difficulty}")
@@ -520,6 +548,17 @@ class Blockchain:
             
             while not self._stop_mining.is_set():
                 try:
+                    # WICHTIG: Vor jedem Mining-Versuch mit dem Netzwerk synchronisieren
+                    if self._sync_callback:
+                        # Wenn eine Sync-Funktion übergeben wurde, rufe sie auf
+                        # Dies ermöglicht dem Node die Synchronisierung mit dem Netzwerk
+                        logger.debug("Syncing with network before mining...")
+                        synced = self._sync_callback()
+                        if synced:
+                            logger.debug("Blockchain synced with network")
+                            # Nach einer Synchronisierung kurz warten, um Race Conditions zu vermeiden
+                            time.sleep(0.5)
+                    
                     # If no pending transactions, create a dummy one to keep mining
                     if not self.pending_transactions:
                         self.add_transaction("network", miner_address, 0, {"type": "empty"})
@@ -531,8 +570,9 @@ class Blockchain:
                     if self.mining_callback:
                         self.mining_callback(block)
                         
-                    # Small delay to prevent CPU overuse
-                    time.sleep(0.1)
+                    # Small delay to prevent CPU overuse and give chance for blockchain sync
+                    # This delay also helps with reducing race conditions between nodes
+                    time.sleep(0.5)
                 except Exception as e:
                     logger.error(f"Error in mining thread: {str(e)}")
                     print(f"Mining error: {str(e)}")

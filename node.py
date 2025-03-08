@@ -20,7 +20,23 @@ logging.basicConfig(
     filename='node.log',
     filemode='a'
 )
+
+# Reduziere Werkzeug (Flask) Logs auf WARNING-Level
+werkzeug_logger = logging.getLogger('werkzeug')
+werkzeug_logger.setLevel(logging.WARNING)
+
+# Node Logger
 logger = logging.getLogger('node')
+
+# Reduziere Logging für häufige Operationen wie Node-Registrierung
+registration_logger = logger.getChild('registration')
+registration_logger.setLevel(logging.WARNING)  # Nur WARNING und höher (ERROR, CRITICAL) loggen
+
+# Bekannte lokale Ports für schnelleren Node-Discovery
+LOCAL_NODE_PORTS = [5000, 5001, 5002, 5003, 5004, 5005]
+
+# Erstelle einen speziellen Logger für gefundene Blöcke
+blocks_logger = logging.getLogger('node.blocks')
 
 class Node:
     def __init__(self, host: str = '0.0.0.0', port: int = 5000, blockchain: Optional[Blockchain] = None):
@@ -38,8 +54,14 @@ class Node:
         # P2P Verbindungsverwaltung
         self.connected_nodes: Dict[str, Dict[str, Any]] = {}  # node_id -> node_info
         
+        # Mining-Adresse speichern, um Mining neu starten zu können
+        self.current_miner_address = None
+        
         # Setup API-Routen
         self.setup_routes()
+        
+        # Automatische Peer-Discovery aktivieren
+        self.discovery_active = True
         
         logger.info(f"Node initialized with ID {self.node_id} at http://{host}:{port}")
         
@@ -301,13 +323,35 @@ class Node:
                 return jsonify({'message': 'Mining address required'}), 400
                 
             miner_address = values.get('address')
+            # Speichere die Mining-Adresse für späteren Neustart
+            self.current_miner_address = miner_address
             
-            # Optional callback to notify about new blocks
+            # Verbesserte Version: Callback für Block-Mining, der sofort Konsensus auslöst
             def mining_callback(block):
-                self.broadcast_new_block()
+                # Sicherheitscheck für potentielle Race Conditions
+                if not block or not hasattr(block, 'hash'):
+                    logger.warning("Received invalid block in mining_callback")
+                    return
+                    
+                logger.info(f"Successfully mined block #{block.index}, hash: {block.hash}")
+                # Sofort anderen Nodes Bescheid geben, dass wir einen neuen Block haben
+                threading.Thread(target=self._immediate_block_broadcast, args=(block,)).start()
             
-            # Start continuous mining
-            self.blockchain.start_continuous_mining(miner_address, mining_callback)
+            # Synchronisierungsfunktion für regelmäßige Konsens-Updates
+            def sync_callback():
+                # Versuche, die Blockchain vor jedem Mining-Versuch zu synchronisieren
+                if self.peers:
+                    try:
+                        updated = self.resolve_conflicts()
+                        if updated:
+                            logger.info("Blockchain updated with network consensus before mining")
+                        return updated
+                    except Exception as e:
+                        logger.error(f"Error during pre-mining sync: {str(e)}")
+                return False
+            
+            # Start continuous mining with improved callbacks
+            self.blockchain.start_continuous_mining(miner_address, mining_callback, sync_callback)
             
             return jsonify({
                 'message': 'Continuous mining started',
@@ -359,10 +403,12 @@ class Node:
             if nodes is None or not isinstance(nodes, list):
                 return jsonify({'message': 'Error: Please supply a valid list of nodes'}), 400
                 
+            registered_count = 0
             for node in nodes:
                 parsed_url = urlparse(node)
                 if parsed_url.netloc:
-                    self.register_node(node)
+                    if self.register_node(node):
+                        registered_count += 1
                     
             # Attempt to notify registered nodes about this node
             self_url = f"http://{self.host}:{self.port}"
@@ -372,9 +418,13 @@ class Node:
                 except requests.RequestException:
                     # Ignorieren wenn der Peer nicht erreichbar ist
                     pass
+            
+            # Nur loggen, wenn tatsächlich neue Nodes hinzugefügt wurden, und nur einmal für alle
+            if registered_count > 0:
+                registration_logger.info(f"Added {registered_count} new nodes, total nodes: {len(self.peers)}")
                 
             return jsonify({
-                'message': 'New nodes have been added',
+                'message': f'Added {registered_count} new nodes',
                 'total_nodes': list(self.peers)
             })
             
@@ -579,6 +629,47 @@ class Node:
             except Exception as e:
                 logger.error(f"Error listing contracts: {str(e)}")
                 return jsonify({'message': f'Error listing contracts: {str(e)}'}), 500
+                
+        # Neue Route für automatische Node-Discovery
+        @self.app.route('/nodes/discovery', methods=['GET'])
+        def node_discovery():
+            """Endpoint for automatic node discovery"""
+            # Gibt Node-ID und URL zurück, damit andere Nodes diesen Node identifizieren können
+            return jsonify({
+                'node_id': self.node_id,
+                'url': f"http://{self.host}:{self.port}",
+                'blockchain_length': len(self.blockchain.chain),
+                'peers_count': len(self.peers)
+            })
+        
+        @self.app.route('/block/notify/<int:block_index>', methods=['POST'])
+        def notify_new_block(block_index):
+            """
+            Benachrichtigung über einen neuen Block auf einem anderen Node
+            """
+            values = request.get_json()
+            
+            if not values or 'node_url' not in values:
+                return jsonify({'message': 'Invalid notification data'}), 400
+                
+            sender_url = values['node_url']
+            
+            # Prüfen, ob unser aktueller Block-Index niedriger ist
+            current_index = len(self.blockchain.chain) - 1
+            
+            if block_index > current_index:
+                # Wir sind hinter dem anderen Node, also starten wir sofort den Konsens
+                threading.Thread(target=self._fetch_from_specific_peer, args=(sender_url,)).start()
+                return jsonify({
+                    'message': 'Will sync with your chain',
+                    'our_index': current_index,
+                    'your_index': block_index
+                })
+            else:
+                return jsonify({
+                    'message': 'Already up to date',
+                    'our_index': current_index
+                })
     
     def start(self):
         """Start the node server"""
@@ -588,6 +679,12 @@ class Node:
         
         # Start periodic peer discovery
         threading.Thread(target=self._periodic_peer_discovery, daemon=True).start()
+        
+        # Start automatic local network discovery (fast version for localhost)
+        threading.Thread(target=self._automatic_local_discovery, daemon=True).start()
+        
+        # Start regelmäßige Konsensus-Bildung (häufiger als zuvor)
+        threading.Thread(target=self._periodic_consensus, daemon=True).start()
         
     def _periodic_peer_discovery(self):
         """Periodically discover and connect to new peers"""
@@ -615,15 +712,89 @@ class Node:
             except requests.RequestException:
                 # Node might be down, consider removing it
                 logger.warning(f"Peer {peer} unreachable during discovery")
+    
+    def _automatic_local_discovery(self):
+        """
+        Verbesserte Funktion für automatisches Entdecken von Nodes
+        Speziell optimiert für lokale Entwicklungsumgebung
+        """
+        # Warte kurz, damit der Server vollständig starten kann
+        time.sleep(2)
+        logger.info("Starting local node discovery on standard ports...")
         
-    def register_node(self, address: str):
+        # Versuche sofort alle bekannten lokalen Ports zu erreichen
+        self._discover_local_nodes()
+        
+        # Starte periodische lokale Entdeckung
+        while self.discovery_active:
+            try:
+                # Nur alle 60 Sekunden prüfen
+                time.sleep(60)
+                self._discover_local_nodes()
+            except Exception as e:
+                logger.error(f"Error in local node discovery: {str(e)}")
+                time.sleep(10)
+        
+    def _discover_local_nodes(self):
+        """
+        Scannt nur localhost auf bekannten Ports, um Nodes zu finden
+        Optimiert für lokale Entwicklung mit mehreren Nodes auf einem Rechner
+        """
+        my_url = f"http://{self.host}:{self.port}"
+        connected_nodes = 0
+        
+        # Prüfe alle bekannten Ports auf localhost
+        for test_port in LOCAL_NODE_PORTS:
+            # Eigenen Port überspringen
+            if test_port == self.port:
+                continue
+                
+            target_url = f"http://localhost:{test_port}"
+            
+            try:
+                # Versuche Verbindung zum Node auf diesem Port herzustellen
+                response = requests.get(f"{target_url}/nodes/discovery", timeout=1)
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    node_url = data.get('url', target_url)
+                    
+                    # Prüfen, ob es sich um einen gültigen Node handelt
+                    if 'node_id' in data and node_url != my_url:
+                        # Node gefunden, registrieren
+                        was_added = self.register_node(node_url)
+                        
+                        if was_added:
+                            connected_nodes += 1
+                            registration_logger.debug(f"Discovered node at {node_url}")  # DEBUG-Level für Discovery
+                            
+                            # Gegenseitige Registrierung (wichtig für P2P-Netzwerk)
+                            try:
+                                requests.post(
+                                    f"{node_url}/nodes/register", 
+                                    json={"nodes": [my_url]},
+                                    timeout=1
+                                )
+                                registration_logger.debug(f"Registered with {node_url}")  # DEBUG-Level für diese Message
+                            except requests.RequestException as e:
+                                registration_logger.warning(f"Failed to register with {node_url}: {str(e)}")
+                            
+            except requests.RequestException:
+                # Ignorieren wenn Port nicht erreichbar ist
+                pass
+                
+        if connected_nodes > 0:
+            registration_logger.info(f"Local discovery found {connected_nodes} nodes")  # Als Information behalten
+        return connected_nodes
+        
+    def register_node(self, address: str) -> bool:
         """Add a new node to the list of peers"""
         parsed_url = urlparse(address)
         if parsed_url.netloc:
             node_url = f"{parsed_url.scheme or 'http'}://{parsed_url.netloc}"
             if node_url not in self.peers and node_url != f"http://{self.host}:{self.port}":
                 self.peers.add(node_url)
-                logger.info(f"Registered peer node: {node_url}")
+                registration_logger.debug(f"Registered peer node: {node_url}")  # Nur DEBUG-Level für einzelne Registrierungen
                 return True
         return False
             
@@ -639,19 +810,48 @@ class Node:
                 
     def broadcast_new_block(self):
         """Notify all nodes about the new block"""
+        # Diese Methode wird durch _immediate_block_broadcast ersetzt,
+        # bleibt aber für Rückwärtskompatibilität erhalten
         for peer in list(self.peers):
             try:
                 requests.get(f"{peer}/nodes/resolve", timeout=2)
-                logger.debug(f"Broadcast new block to {peer}")
+                logger.debug(f"Legacy broadcast new block to {peer}")
             except requests.RequestException as e:
                 logger.warning(f"Could not broadcast new block to {peer}: {str(e)}")
+                
+    def _periodic_consensus(self):
+        """
+        Führt in regelmäßigen Abständen den Konsensus-Algorithmus aus
+        """
+        # Warte kurz, um dem Node Zeit zum Starten zu geben
+        time.sleep(5)
+        logger.info("Starting periodic blockchain consensus...")
+        
+        while True:
+            try:
+                # Nur ausführen, wenn Peers vorhanden sind
+                if self.peers:
+                    success = self.resolve_conflicts()
+                    if success:
+                        logger.info("Periodic consensus check: Chain was updated")
+                    else:
+                        logger.debug("Periodic consensus check: No update needed")
+                    
+                # Alle 10 Sekunden prüfen (statt 30 Sekunden) für schnellere Synchronisation
+                time.sleep(10)
+                
+            except Exception as e:
+                logger.error(f"Error in periodic consensus: {str(e)}")
+                time.sleep(10)
                 
     def resolve_conflicts(self) -> bool:
         """
         Consensus algorithm: resolve conflicts by replacing our chain with the longest valid chain in the network
         """
         new_chain = None
-        max_length = len(self.blockchain.chain)
+        current_length = len(self.blockchain.chain)
+        max_length = current_length
+        source_node = None
         
         # Grab and verify the chains from all the nodes in our network
         for peer in list(self.peers):
@@ -666,6 +866,7 @@ class Node:
                     if length > max_length and self._is_chain_valid(chain):
                         max_length = length
                         new_chain = chain
+                        source_node = peer
                         logger.info(f"Found longer valid chain from {peer} with length {length}")
             except requests.RequestException as e:
                 logger.warning(f"Error getting blockchain from {peer}: {str(e)}")
@@ -673,50 +874,235 @@ class Node:
                 
         # Replace our chain if we discovered a new, valid chain longer than ours
         if new_chain:
-            # In einer vollständigen Implementierung würde hier die Kette korrekt 
-            # konvertiert und validiert werden
-            logger.info("Replacing local chain with network chain")
+            # Logge alle Blöcke, die dem lokalen Node fehlen
+            missing_blocks_count = max_length - current_length
+            blocks_logger.info(f"Importing {missing_blocks_count} new blocks from node {source_node}")
+            
+            # Extrahiere neue Block-Informationen für verbesserte Logs
+            for i in range(current_length, max_length):
+                block = new_chain[i]
+                tx_count = len(block['transactions'])
+                miner = "unknown"
+                
+                # Finde den Miner (Empfänger der Mining-Belohnung)
+                for tx in block['transactions']:
+                    if tx.get('from') == 'network' and tx.get('type') == 'reward':
+                        miner = tx.get('to', 'unknown')
+                        break
+                
+                blocks_logger.info(
+                    f"Block #{i} from peer {source_node} - "
+                    f"Hash: {block['hash'][:10]}... | "
+                    f"Mined by: {miner} | "
+                    f"Transactions: {tx_count}"
+                )
+                
+                # Zeige auch eine Zusammenfassung im Terminal an
+                print(f"Imported Block #{i} from peer node - Mined by: {miner}")
+                
+            logger.info(f"Replacing local chain (length: {current_length}) with network chain (length: {max_length})")
             self._replace_chain(new_chain)
             return True
             
+        logger.debug("Local chain is authoritative, no consensus action needed")
         return False
     
     def _is_chain_valid(self, chain) -> bool:
         """
         Verify if a given blockchain is valid
-        Einfache Validierung für Demo-Zwecke
         """
-        # In einer echten Implementierung: vollständige Validierung der Kette
+        # Prüfe jeden Block in der Kette
+        for i, block_data in enumerate(chain):
+            # Genesis-Block überspringen
+            if i == 0:
+                continue
+                
+            # Vorherigen Block erhalten
+            prev_block_data = chain[i-1]
+            
+            # 1. Prüfen, ob der previous_hash korrekt ist
+            if block_data['previous_hash'] != prev_block_data['hash']:
+                logger.error(f"Invalid previous hash in block {i}")
+                return False
+                
+            # 2. Prüfen, ob der Hash den richtigen Schwierigkeitsgrad hat
+            difficulty = block_data.get('difficulty', 4)
+            if block_data['hash'][:difficulty] != '0' * difficulty:
+                logger.error(f"Invalid proof of work in block {i}")
+                return False
+                
+            # 3. Prüfen, ob der Index korrekt ist
+            if block_data['index'] != i:
+                logger.error(f"Invalid block index {block_data['index']} at position {i}")
+                return False
+                
+        logger.info(f"External chain with {len(chain)} blocks validated successfully")
         return True
     
     def _replace_chain(self, new_chain):
         """
         Replace the local chain with the given one
-        Vereinfachte Version für Demo-Zwecke
         """
-        # In einer echten Implementierung würde hier die neue Chain
-        # korrekt in Block-Objekte konvertiert werden
-        # Für diese Demo-Version vereinfacht
-        self.blockchain.chain = []
-        
-        for block_data in new_chain:
-            # Konvertiere JSON-Daten in Block-Objekt
-            block = Block(
-                index=block_data['index'],
-                timestamp=block_data['timestamp'],
-                transactions=block_data['transactions'],
-                previous_hash=block_data['previous_hash'],
-                nonce=block_data['nonce']
-            )
-            block.hash = block_data['hash']
-            block.merkle_root = block_data.get('merkle_root', '')
-            block.difficulty = block_data.get('difficulty', 4)
+        try:
+            # Speichere den Mining-Status, bevor wir die Chain ersetzen
+            was_mining = False
+            mining_address = self.current_miner_address
             
-            # Füge Block zur Kette hinzu
-            self.blockchain.chain.append(block)
-        
-        logger.info(f"Chain replaced with {len(self.blockchain.chain)} blocks")
+            # Stoppt das Mining, falls aktiv, da sonst Race Conditions entstehen können
+            if self.blockchain._mining_thread and self.blockchain._mining_thread.is_alive():
+                was_mining = True
+                logger.info("Temporarily stopping mining to update blockchain")
+                self.blockchain.stop_continuous_mining()
+                
+            # Sichere ausstehende Transaktionen vor dem Ersetzen der Blockchain
+            pending_transactions = self.blockchain.pending_transactions.copy()
+            
+            # Führe ausstehende Transaktionen zusammen und entferne Duplikate
+            existing_tx_ids = set()
+            for block in new_chain:
+                for tx in block['transactions']:
+                    if 'id' in tx:
+                        existing_tx_ids.add(tx['id'])
+            
+            # Setze die Blockchain zurück und füge alle Blöcke hinzu
+            self.blockchain.chain = []
+            
+            for block_data in new_chain:
+                # Konvertiere JSON-Daten in Block-Objekt
+                block = Block(
+                    index=block_data['index'],
+                    timestamp=block_data['timestamp'],
+                    transactions=block_data['transactions'],
+                    previous_hash=block_data['previous_hash'],
+                    nonce=block_data['nonce']
+                )
+                block.hash = block_data['hash']
+                block.merkle_root = block_data.get('merkle_root', '')
+                block.difficulty = block_data.get('difficulty', 4)
+                
+                # Füge Block zur Kette hinzu
+                self.blockchain.chain.append(block)
+                
+            # Aktualisiere die Schwierigkeit basierend auf der neuen Kette
+            self.blockchain.difficulty = new_chain[-1].get('difficulty', 4)
+            
+            # Füge die ausstehenden Transaktionen wieder hinzu, die noch nicht in der neuen Kette sind
+            for tx in pending_transactions:
+                if 'id' in tx and tx['id'] not in existing_tx_ids:
+                    self.blockchain.pending_transactions.append(tx)
+            
+            # Starte das Mining wieder, falls es vorher aktiv war
+            if was_mining and mining_address:
+                logger.info(f"Restarting mining with address {mining_address}")
+                
+                # Mining-Callbacks für Block-Notifications und Synchronisierung
+                def mining_callback(block):
+                    if not block or not hasattr(block, 'hash'):
+                        return
+                    logger.info(f"Successfully mined block #{block.index}, hash: {block.hash}")
+                    threading.Thread(target=self._immediate_block_broadcast, args=(block,)).start()
+                
+                def sync_callback():
+                    if self.peers:
+                        try:
+                            updated = self.resolve_conflicts()
+                            return updated
+                        except Exception as e:
+                            logger.error(f"Error during pre-mining sync: {str(e)}")
+                    return False
+                
+                # Starte das Mining neu mit denselben Callbacks wie zuvor
+                self.blockchain.start_continuous_mining(mining_address, mining_callback, sync_callback)
+                print(f"Mining restarted with address: {mining_address}")
+            
+            logger.info(f"Successfully replaced chain with {len(self.blockchain.chain)} blocks")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error replacing chain: {str(e)}")
+            return False
 
+    def _immediate_block_broadcast(self, block):
+        """
+        Benachrichtigt sofort alle Peers über einen neu geminten Block
+        """
+        if not self.peers:
+            logger.debug("No peers to broadcast new block to")
+            return
+            
+        # Bereite einfache Notification vor (keine volle Blockchain-Übertragung)
+        self_url = f"http://{self.host}:{self.port}"
+        notification_data = {
+            'node_url': self_url,
+            'block_index': block.index,
+            'block_hash': block.hash
+        }
+        
+        logger.info(f"Broadcasting new block #{block.index} to {len(self.peers)} peers")
+        
+        # Benachrichtige alle Peers parallel
+        for peer in list(self.peers):
+            threading.Thread(
+                target=self._notify_peer_about_block, 
+                args=(peer, block.index, notification_data)
+            ).start()
+    
+    def _notify_peer_about_block(self, peer_url, block_index, notification_data):
+        """
+        Benachrichtigt einen bestimmten Peer über einen neuen Block
+        """
+        try:
+            requests.post(
+                f"{peer_url}/block/notify/{block_index}",
+                json=notification_data,
+                timeout=2
+            )
+            logger.debug(f"Notified {peer_url} about new block #{block_index}")
+        except requests.RequestException as e:
+            logger.warning(f"Failed to notify {peer_url} about new block: {str(e)}")
+    
+    def _fetch_from_specific_peer(self, peer_url):
+        """
+        Lädt die Blockchain von einem bestimmten Peer
+        Verwendet für gezielte Synchronisierung nach Block-Benachrichtigungen
+        """
+        try:
+            response = requests.get(f"{peer_url}/blockchain", timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                chain = data['chain']
+                
+                if self._is_chain_valid(chain) and len(chain) > len(self.blockchain.chain):
+                    current_length = len(self.blockchain.chain)
+                    new_length = len(chain)
+                    
+                    blocks_logger.info(f"Received notification for new block(s) from {peer_url}")
+                    for i in range(current_length, new_length):
+                        block = chain[i]
+                        miner = "unknown"
+                        
+                        # Finde den Miner (Empfänger der Mining-Belohnung)
+                        for tx in block['transactions']:
+                            if tx.get('from') == 'network' and tx.get('type') == 'reward':
+                                miner = tx.get('to', 'unknown')
+                                break
+                        
+                        blocks_logger.info(
+                            f"New Block #{i} notification - "
+                            f"Hash: {block['hash'][:10]}... | "
+                            f"Mined by: {miner} | "
+                            f"Difficulty: {block.get('difficulty', 4)}"
+                        )
+                        
+                        print(f"Received new Block #{i} - Mined by: {miner} - Difficulty: {block.get('difficulty', 4)}")
+                    
+                    logger.info(f"Updating chain from peer {peer_url}, new length: {len(chain)}")
+                    self._replace_chain(chain)
+                    return True
+        except requests.RequestException as e:
+            logger.warning(f"Error fetching blockchain from {peer_url}: {str(e)}")
+            
+        return False
 
 if __name__ == "__main__":
     node = Node()

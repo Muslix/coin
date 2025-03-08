@@ -24,6 +24,66 @@ test-one:
 start-node:
 	$(PYTHON) main.py start-node --port $(PORT) --host $(HOST)
 
+# Mehrere Nodes starten (für Multi-Mining-Setups)
+# Verwendung: make start-node-1 für Port 5000
+start-node-1:
+	$(PYTHON) main.py start-node --port 5000 --host $(HOST)
+
+# Verwendung: make start-node-2 für Port 5001
+start-node-2:
+	$(PYTHON) main.py start-node --port 5001 --host $(HOST)
+
+# Verwendung: make start-node-3 für Port 5002
+start-node-3:
+	$(PYTHON) main.py start-node --port 5002 --host $(HOST)
+
+# Nodes miteinander verbinden
+# Verwendung: make connect-nodes um alle lokalen Nodes (Ports 5000-5002) zu verbinden
+connect-nodes:
+	@echo "Verbinde Nodes miteinander..."
+	curl -s -X POST -H "Content-Type: application/json" \
+	-d '{"nodes": ["http://localhost:5001", "http://localhost:5002"]}' \
+	http://localhost:5000/nodes/register
+	curl -s -X POST -H "Content-Type: application/json" \
+	-d '{"nodes": ["http://localhost:5000", "http://localhost:5002"]}' \
+	http://localhost:5001/nodes/register
+	curl -s -X POST -H "Content-Type: application/json" \
+	-d '{"nodes": ["http://localhost:5000", "http://localhost:5001"]}' \
+	http://localhost:5002/nodes/register
+	@echo "Nodes verbunden!"
+
+# Mining auf einem bestimmten Node starten
+# Verwendung: make start-mining-on-node-1 ADDRESS=Ihre_Mining_Adresse
+start-mining-on-node-1:
+	curl -s -X POST -H "Content-Type: application/json" \
+	-d '{"address": "$(ADDRESS)"}' http://localhost:5000/mining/start | python -m json.tool
+
+# Verwendung: make start-mining-on-node-2 ADDRESS=Ihre_Mining_Adresse
+start-mining-on-node-2:
+	curl -s -X POST -H "Content-Type: application/json" \
+	-d '{"address": "$(ADDRESS)"}' http://localhost:5001/mining/start | python -m json.tool
+
+# Verwendung: make start-mining-on-node-3 ADDRESS=Ihre_Mining_Adresse
+start-mining-on-node-3:
+	curl -s -X POST -H "Content-Type: application/json" \
+	-d '{"address": "$(ADDRESS)"}' http://localhost:5002/mining/start | python -m json.tool
+
+# Mining auf einem bestimmten Node stoppen
+stop-mining-on-node-1:
+	curl -s -X POST http://localhost:5000/mining/stop | python -m json.tool
+
+stop-mining-on-node-2:
+	curl -s -X POST http://localhost:5001/mining/stop | python -m json.tool
+
+stop-mining-on-node-3:
+	curl -s -X POST http://localhost:5002/mining/stop | python -m json.tool
+
+pause-node:
+	$(PYTHON) main.py pause-node
+
+resume-node:
+	$(PYTHON) main.py resume-node
+
 # Wallet erstellen
 create-wallet:
 	$(PYTHON) main.py create-wallet
@@ -160,6 +220,10 @@ help:
 	@echo ""
 	@echo "Node-Verwaltung:"
 	@echo "  make start-node               - Startet einen Blockchain-Node"
+	@echo "  make start-node-1             - Startet Node auf Port 5000"
+	@echo "  make start-node-2             - Startet Node auf Port 5001"
+	@echo "  make start-node-3             - Startet Node auf Port 5002"
+	@echo "  make connect-nodes            - Verbindet alle lokalen Nodes miteinander"
 	@echo "  make register-node NODE=URL   - Registriert einen anderen Node"
 	@echo "  make list-nodes               - Zeigt alle verbundenen Nodes"
 	@echo "  make resolve-conflicts        - Führt den Konsensus-Algorithmus aus"
@@ -181,6 +245,12 @@ help:
 	@echo "  make mine ADDRESS=X           - Mined einen einzelnen Block"
 	@echo "  make start-mining ADDRESS=X   - Startet kontinuierliches Mining"
 	@echo "  make stop-mining              - Stoppt das Mining"
+	@echo "  make start-mining-on-node-1 ADDRESS=X - Startet Mining auf Node 1 (Port 5000)"
+	@echo "  make start-mining-on-node-2 ADDRESS=X - Startet Mining auf Node 2 (Port 5001)"
+	@echo "  make start-mining-on-node-3 ADDRESS=X - Startet Mining auf Node 3 (Port 5002)"
+	@echo "  make stop-mining-on-node-1    - Stoppt Mining auf Node 1"
+	@echo "  make stop-mining-on-node-2    - Stoppt Mining auf Node 2"
+	@echo "  make stop-mining-on-node-3    - Stoppt Mining auf Node 3"
 	@echo "  make mining-stats             - Zeigt Mining-Statistiken"
 	@echo "  make set-difficulty DIFFICULTY=X - Setzt die Mining-Schwierigkeit"
 	@echo ""
@@ -196,4 +266,4 @@ help:
 	@echo "  make contract-state ID=X      - Zeigt den Zustand eines Contracts"
 	@echo "  make list-contracts           - Listet alle deployt Contracts auf"
 
-.PHONY: install test test-one start-node create-wallet save-wallet load-wallet check-balance send-transaction mine start-mining stop-mining mining-stats set-difficulty print-chain get-blockchain get-block pending-transactions transaction-history register-node list-nodes resolve-conflicts health-check node-info help deploy-contract call-contract contract-state list-contracts
+.PHONY: install test test-one start-node start-node-1 start-node-2 start-node-3 connect-nodes start-mining-on-node-1 start-mining-on-node-2 start-mining-on-node-3 stop-mining-on-node-1 stop-mining-on-node-2 stop-mining-on-node-3 create-wallet save-wallet load-wallet check-balance send-transaction mine start-mining stop-mining mining-stats set-difficulty print-chain get-blockchain get-block pending-transactions transaction-history register-node list-nodes resolve-conflicts health-check node-info help deploy-contract call-contract contract-state list-contracts
