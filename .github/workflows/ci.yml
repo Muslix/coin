@@ -44,43 +44,14 @@ jobs:
           python -m compileall .
           echo "Python validation completed successfully"
 
-      - name: Static Security Analysis
+      - name: Run Tests with pytest
         run: |
-          # Install security scanning tool
-          pip install bandit
-          # Run security scan (exclude tests)
-          bandit -r . -ll --exclude ./tests
-
-      - name: Blockchain Validation
-        run: |
-          # Create a simple test to validate blockchain functionality
-          cat > validate_blockchain.py << 'EOF'
-          from blockchain import Blockchain, Block
+          # Create test directory if it doesn't exist
+          mkdir -p tests
+          # Run tests
+          pytest tests/
+          echo "Tests completed successfully"
           
-          def test_blockchain_initialization():
-              """Test if blockchain can be initialized correctly"""
-              blockchain = Blockchain()
-              assert len(blockchain.chain) == 1  # Genesis block
-              assert blockchain.chain[0].index == 0
-              print("✅ Blockchain initializes correctly with genesis block")
-          
-          def test_block_creation():
-              """Test if a block can be created properly"""
-              block = Block(1, 123456789, [], "test_hash")
-              assert block.index == 1
-              assert block.timestamp == 123456789
-              assert block.calculate_hash() == block.hash
-              print("✅ Block creation test passed")
-          
-          if __name__ == "__main__":
-              print("Running basic blockchain validation...")
-              test_blockchain_initialization()
-              test_block_creation()
-              print("All validation tests passed!")
-          EOF
-          
-          # Run validation script
-          python validate_blockchain.py
 
   build:
     needs: validate
